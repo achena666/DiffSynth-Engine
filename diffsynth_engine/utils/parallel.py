@@ -252,7 +252,7 @@ def _worker_loop(
     sp_ring_degree: int,
     tp_degree: int,
     use_fsdp: bool,
-    master_port: int = 29500,
+    master_port: Optional[int] = None,
     device_type: str = "cuda",
 ):
     """
@@ -264,6 +264,9 @@ def _worker_loop(
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
         os.environ["MASTER_ADDR"] = "localhost"
+        if master_port is None:
+            # 允许同机并存多个任务：默认端口可被 MASTER_PORT 覆盖
+            master_port = int(os.environ.get("MASTER_PORT", "29500"))
         os.environ["MASTER_PORT"] = str(master_port)
         device = torch.device(type=device_type, index=rank)
         # NPU-only distributed env; keep CUDA path free of LOCAL_RANK side effects.
@@ -274,14 +277,17 @@ def _worker_loop(
         backend = get_torch_distributed_backend(device_type)
 
         timeout = timedelta(seconds=NCCL_TIMEOUT_SEC)
-        dist.init_process_group(
-            backend=backend,
-            init_method="env://",
-            timeout=timeout,
-            world_size=world_size,
-            rank=rank,
-            device_id=device,
-        )
+        pg_kwargs = {
+            "backend": backend,
+            "init_method": "env://",
+            "timeout": timeout,
+            "world_size": world_size,
+            "rank": rank,
+        }
+        if device_type == "cuda":
+            # device_id 是 NCCL 专有参数，HCCL 不接受
+            pg_kwargs["device_id"] = device
+        dist.init_process_group(**pg_kwargs)
         init_parallel_pgs(
             cfg_degree=cfg_degree,
             sp_ulysses_degree=sp_ulysses_degree,
@@ -362,7 +368,7 @@ class ParallelWrapper:
         sp_ring_degree: int,
         tp_degree: int,
         use_fsdp: bool = False,
-        master_port: int = 29500,
+        master_port: Optional[int] = None,
         device_type: Optional[str] = None,
     ):
         super().__init__()
