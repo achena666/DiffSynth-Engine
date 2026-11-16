@@ -1,3 +1,5 @@
+from functools import lru_cache
+
 import torch
 
 from diffsynth_engine.layers.attention.backends.abstract import (
@@ -7,9 +9,33 @@ from diffsynth_engine.layers.attention.backends.abstract import (
     AttentionMetadataBuilder,
     AttentionType,
 )
+from diffsynth_engine.layers.attention.backends.ascend_attn import AscendFusedAttentionImpl
 from diffsynth_engine.utils import logging
 
 logger = logging.get_logger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _use_mindie_impl() -> bool:
+    """Whether MindIE's kernel can actually run here.
+
+    Probing allocates an NPU tensor and runs one attention pass, and the answer
+    is asked for every time a ``USPAttention`` is constructed, so cache it.
+    """
+    from diffsynth_engine.platforms.ascend import is_mindie_attention_available
+
+    try:
+        available = bool(is_mindie_attention_available())
+    except Exception:
+        available = False
+    if not available:
+        # Say so rather than silently switching kernels: "mindie" then means
+        # "the Ascend fused kernel", which is also the only path that can drive ring.
+        logger.warning(
+            "MindIE-SD kernels are unavailable; the mindie attention backend falls back to "
+            "torch_npu's fused attention (ring attention stays available)."
+        )
+    return available
 
 
 class MindieAttentionMetadataBuilder(AttentionMetadataBuilder):
@@ -21,20 +47,22 @@ class MindieAttentionMetadataBuilder(AttentionMetadataBuilder):
 
 
 class MindieAttentionBackend(AttentionBackend):
+    """Ascend attention backend: MindIE when it is usable, the fused kernel otherwise.
+
+    MindIE-SD is preferred because it is the vendor-tuned path for this device.
+    It is not a hard requirement: ``get_impl_cls`` falls back to the fused kernel
+    when MindIE is missing or fails its probe, which keeps the backend usable on a
+    plain torch_npu install. The fallback is not only a degradation -- MindIE's
+    ``attention_forward`` returns no softmax statistics, so the fused kernel is
+    what makes ring attention possible on Ascend.
+    """
+
     @staticmethod
     def check_availability() -> None:
-        from diffsynth_engine.platforms.ascend import AscendPlatform, is_mindie_attention_available
+        from diffsynth_engine.platforms.ascend import AscendPlatform
 
         if not AscendPlatform.is_available():
-            error_msg = "MindIE attention requires an available Ascend NPU device."
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
-        if not is_mindie_attention_available():
-            error_msg = (
-                "MindIE attention backend is not available. "
-                "Install MindIE-SD 3.x matching the current torch_npu and CANN versions, "
-                "and ensure mindiesd.layers.flash_attn.attention_forward works on NPU."
-            )
+            error_msg = "The mindie attention backend requires an available Ascend NPU device."
             logger.error(error_msg)
             raise RuntimeError(error_msg)
 
@@ -44,7 +72,7 @@ class MindieAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["AttentionImpl"]:
-        return MindieAttentionImpl
+        return MindieAttentionImpl if _use_mindie_impl() else AscendFusedAttentionImpl
 
     @staticmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
@@ -60,7 +88,9 @@ class MindieAttentionBackend(AttentionBackend):
 
     @classmethod
     def supports_ring_attention(cls) -> bool:
-        return False
+        # Ring merges per-shard softmax statistics, so it follows whichever impl
+        # is selected rather than the backend name.
+        return cls.get_impl_cls() is AscendFusedAttentionImpl
 
 
 class MindieAttentionImpl(AttentionImpl):

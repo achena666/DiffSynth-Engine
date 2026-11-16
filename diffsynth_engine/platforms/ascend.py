@@ -186,3 +186,104 @@ class AscendPlatform(PlatformBackend):
 
         CompilationConfig.fusion_patterns.enable_fast_gelu = False
         return MindieSDBackend()
+
+    # ------------------------------------------------------------------
+    # Compute ops
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def supports_fused_attention(cls) -> bool:
+        return True
+
+    @classmethod
+    def fused_attention(
+        cls,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        num_heads: int,
+        scale: float,
+        causal: bool = False,
+        attn_mask: torch.Tensor | None = None,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        torch_npu = _import_torch_npu()
+
+        bool_mask = None
+        if attn_mask is not None:
+            # The kernel wants True = keep. Additive float masks (0 keep, -inf
+            # drop) are the common form elsewhere, so convert rather than reject.
+            bool_mask = attn_mask if attn_mask.dtype == torch.bool else attn_mask >= 0
+
+        # sparse_mode=2 is the right-down causal triangle the kernel generates
+        # internally, and it cannot be combined with an explicit mask.
+        sparse_mode = 2 if (causal and bool_mask is None) else 0
+
+        result = torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            head_num=num_heads,
+            input_layout="BSND",
+            scale=scale,
+            keep_prob=1.0,
+            sparse_mode=sparse_mode,
+            atten_mask=bool_mask,
+        )
+        if not return_lse:
+            return result[0]
+        return result[0], _lse_from_softmax_stats(result)
+
+    @classmethod
+    def dynamic_quant(cls, x: torch.Tensor, *, fp8: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        torch_npu = _import_torch_npu()
+        if not fp8:
+            return torch_npu.npu_dynamic_quant(x)
+        return torch_npu.npu_dynamic_quant(x, dst_type=_fp8_dst_type(cls))
+
+    @classmethod
+    def quant_matmul(
+        cls,
+        x_q: torch.Tensor,
+        weight_q: torch.Tensor,
+        weight_scale: torch.Tensor,
+        act_scale: torch.Tensor,
+        out_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        torch_npu = _import_torch_npu()
+        return torch_npu.npu_quant_matmul(
+            x_q,
+            weight_q,
+            scale=weight_scale,
+            pertoken_scale=act_scale,
+            output_dtype=out_dtype,
+        )
+
+
+# aclDataType ACL_FLOAT8_E4M3FN is 36, and torch_npu offsets its internal dtype
+# ids by 256, so the fused ops want 292. The constant lives next to the only
+# code that uses it instead of leaking a magic number into the quantization layer.
+_ACL_FLOAT8_E4M3FN = 36
+_TORCH_NPU_DTYPE_OFFSET = 256
+
+
+def _fp8_dst_type(platform: type[PlatformBackend]) -> int:
+    dtype = platform.fp8_dtype()
+    if dtype is not torch.float8_e4m3fn:
+        raise ValueError(f"Unexpected fp8 dtype {dtype} on {platform.name}; the fused ops only know e4m3.")
+    return _ACL_FLOAT8_E4M3FN + _TORCH_NPU_DTYPE_OFFSET
+
+
+def _lse_from_softmax_stats(result: Any) -> torch.Tensor:
+    """log-sum-exp built from the softmax_max / softmax_sum the kernel returns."""
+    softmax_max, softmax_sum = result[1], result[2]
+    if not torch.is_tensor(softmax_sum) or softmax_sum.numel() == 0:
+        raise RuntimeError(
+            "npu_fusion_attention returned no softmax statistics, so ring attention cannot "
+            "merge shards. This happens on CANN builds that only fill softmax_max/softmax_sum "
+            "when gradients are required."
+        )
+    # Shape is [B, H, S, 8]: the trailing dim is alignment padding that repeats
+    # the same value, so index 0 instead of summing over it.
+    return torch.log(softmax_sum[..., 0].float().clamp(min=1e-30)) + softmax_max[..., 0].float()

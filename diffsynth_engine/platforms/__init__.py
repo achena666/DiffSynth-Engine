@@ -167,6 +167,28 @@ def get_compile_kwargs() -> dict:
     return get_platform().compile_kwargs()
 
 
+def supports_fused_attention() -> bool:
+    return get_platform().supports_fused_attention()
+
+
+def fused_attention(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, **kwargs):
+    return get_platform().fused_attention(query, key, value, **kwargs)
+
+
+def dynamic_quant(x: torch.Tensor, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
+    return get_platform().dynamic_quant(x, **kwargs)
+
+
+def quant_matmul(
+    x_q: torch.Tensor,
+    weight_q: torch.Tensor,
+    weight_scale: torch.Tensor,
+    act_scale: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    return get_platform().quant_matmul(x_q, weight_q, weight_scale, act_scale, out_dtype)
+
+
 DTYPE_MAP: dict[str, torch.dtype] = {
     # Integer dtypes
     "uint8": torch.uint8,
@@ -236,6 +258,10 @@ __all__ = [
     "pin_memory",
     "get_torch_distributed_backend",
     "get_compile_kwargs",
+    "supports_fused_attention",
+    "fused_attention",
+    "dynamic_quant",
+    "quant_matmul",
     "DTYPE_MAP",
     "torch_dtype_to_str",
     "str_to_torch_dtype",

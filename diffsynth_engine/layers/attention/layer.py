@@ -149,10 +149,18 @@ class USPAttention(nn.Module):
         ulysses_parallel_world_size = get_ulysses_parallel_world_size() if is_sp_group_initialized() else 1
         ring_parallel_world_size = get_ring_parallel_world_size() if is_sp_group_initialized() else 1
 
-        if ring_parallel_world_size > 1 and self.attn_type == "mindie":
+        # Only the mindie backend can end up without softmax statistics: its MindIE
+        # implementation has no forward_with_lse, while the fused fallback does.
+        # The type check stays first so every other backend short-circuits here
+        # exactly as before -- nothing changes for CUDA, by construction.
+        if (
+            ring_parallel_world_size > 1
+            and self.attn_type == "mindie"
+            and not hasattr(self.attn_impl, "forward_with_lse")
+        ):
             raise RuntimeError(
-                "NPU MindIE attention currently supports Ulysses only "
-                f"(sp_ring_degree must be 1, got {ring_parallel_world_size})"
+                "The mindie attention backend cannot drive ring attention while MindIE-SD is the "
+                f"selected kernel, because it returns no softmax statistics (sp_ring_degree={ring_parallel_world_size})."
             )
 
         if ulysses_parallel_world_size > 1:
