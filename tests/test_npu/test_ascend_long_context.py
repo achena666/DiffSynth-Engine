@@ -12,6 +12,7 @@ from diffsynth_engine.layers.attention import AttentionType, ascend_long_context
     [
         ("mindie", True, True, 1, True),
         (AttentionType.MINDIE, True, True, 1, True),
+        (AttentionType.MINDIE_FP8, True, True, 1, False),
         ("sdpa", True, True, 1, False),
         (None, True, True, 1, False),
         ("mindie", False, True, 1, False),

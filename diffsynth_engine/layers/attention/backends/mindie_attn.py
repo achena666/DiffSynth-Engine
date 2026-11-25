@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import torch
 
 from diffsynth_engine.layers.attention.backends.abstract import (
@@ -12,12 +14,29 @@ from diffsynth_engine.utils import logging
 logger = logging.get_logger(__name__)
 
 
+@dataclass
+class MindieAttentionMetadata(AttentionMetadata):
+    precision: str = "fp8"
+    fp8_fa_mode: str | None = None
+    rotation_mode: str | None = None
+
+
 class MindieAttentionMetadataBuilder(AttentionMetadataBuilder):
     def __init__(self) -> None:
         pass
 
-    def build(self, **kwargs) -> AttentionMetadata:
-        return AttentionMetadata()
+    def build(
+        self,
+        precision: str = "fp8",
+        fp8_fa_mode: str | None = None,
+        rotation_mode: str | None = None,
+        **kwargs,
+    ) -> MindieAttentionMetadata:
+        return MindieAttentionMetadata(
+            precision=precision,
+            fp8_fa_mode=fp8_fa_mode,
+            rotation_mode=rotation_mode,
+        )
 
 
 class MindieAttentionBackend(AttentionBackend):
@@ -48,7 +67,7 @@ class MindieAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
-        return AttentionMetadata
+        return MindieAttentionMetadata
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
@@ -168,13 +187,11 @@ def _prepare_attention_mask(
         if tuple(drop_mask.shape) == (q_seqlen, kv_seqlen):
             return drop_mask[None, None, :, :]
         raise ValueError(
-            "2D attn_mask must be key-padding [B, S_kv] or pairwise "
-            f"[S_q, S_kv], got {tuple(drop_mask.shape)}"
+            f"2D attn_mask must be key-padding [B, S_kv] or pairwise [S_q, S_kv], got {tuple(drop_mask.shape)}"
         )
     if drop_mask.dim() != 4:
         raise ValueError(
-            "attn_mask must be [B, S_kv], [S_q, S_kv], or [B, H, S_q, S_kv], "
-            f"got {tuple(drop_mask.shape)}"
+            f"attn_mask must be [B, S_kv], [S_q, S_kv], or [B, H, S_q, S_kv], got {tuple(drop_mask.shape)}"
         )
     return drop_mask
 
@@ -186,3 +203,96 @@ def _lse_from_softmax_stats(result) -> torch.Tensor:
             "npu_fusion_attention returned no softmax statistics, so ring attention cannot merge shards."
         )
     return torch.log(softmax_sum[..., 0].float().clamp(min=1e-30)) + softmax_max[..., 0].float()
+
+
+class MindieAttentionFp8Backend(MindieAttentionBackend):
+    @staticmethod
+    def check_availability() -> None:
+        from diffsynth_engine.platforms.ascend import is_mindie_fp8_attention_available
+
+        if not is_mindie_fp8_attention_available():
+            error_msg = (
+                "MindIE FP8 attention is not available. It requires an Ascend A5 device "
+                "and a MindIE-SD installation exposing mindiesd.quant_attention."
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+
+    @staticmethod
+    def get_type() -> str:
+        return str(AttentionType.MINDIE_FP8)
+
+    @staticmethod
+    def get_impl_cls() -> type["AttentionImpl"]:
+        return MindieAttentionFp8Impl
+
+    @classmethod
+    def supports_ring_attention(cls) -> bool:
+        return False
+
+
+class MindieAttentionFp8Impl(AttentionImpl):
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        softmax_scale: float | None = None,
+        causal: bool = False,
+        num_kv_heads: int | None = None,
+        **extra_impl_args,
+    ) -> None:
+        if num_kv_heads is None:
+            num_kv_heads = num_heads
+        if num_heads % num_kv_heads != 0:
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads})")
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.num_kv_heads = num_kv_heads
+        self.softmax_scale = softmax_scale
+        self.causal = causal
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        metadata = attn_metadata or MindieAttentionMetadata()
+        if not isinstance(metadata, MindieAttentionMetadata):
+            raise TypeError(f"Expected MindieAttentionMetadata, got {type(metadata).__name__}")
+        if query.dim() != 4:
+            raise ValueError(f"MindIE FP8 attention expects BSND inputs, got shape {tuple(query.shape)}")
+        if metadata.precision == "fp8" and query.shape[0] != 1:
+            raise ValueError(f"MindIE block-FP8 attention requires batch size 1, got {query.shape[0]}")
+        if attn_mask is not None:
+            raise ValueError("MindIE FP8/MXFP8 attention does not support attn_mask")
+        if self.causal and query.shape[1] != key.shape[1]:
+            raise ValueError(
+                "MindIE FP8/MXFP8 attention supports unequal query/key lengths when non-causal, "
+                "but this backend's causal mapping requires equal lengths; "
+                f"got query={query.shape[1]} and key={key.shape[1]}"
+            )
+
+        from mindiesd.layers.flash_attn.quant_flash_attn import quant_attention
+
+        quant_kwargs = {}
+        if self.softmax_scale is not None:
+            quant_kwargs["scale"] = self.softmax_scale
+        if self.causal:
+            quant_kwargs["next_tokens"] = 0
+        if metadata.fp8_fa_mode is not None:
+            quant_kwargs["fp8_fa_mode"] = metadata.fp8_fa_mode
+        if metadata.rotation_mode is not None:
+            quant_kwargs["rotation_mode"] = metadata.rotation_mode
+
+        return quant_attention(
+            query,
+            key,
+            value,
+            precision=metadata.precision,
+            layout="BSND",
+            **quant_kwargs,
+        )

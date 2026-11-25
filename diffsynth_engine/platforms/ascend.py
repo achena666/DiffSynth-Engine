@@ -83,6 +83,31 @@ def is_mindie_attention_available() -> bool:
         return False
 
 
+def _probe_mindie_fp8_attention(quant_attention: Any) -> bool:
+    try:
+        query = torch.randn(1, 128, 8, 128, device="npu:0", dtype=torch.bfloat16)
+        with torch.no_grad():
+            output = quant_attention(query, query, query, precision="fp8", layout="BSND")
+        if output.shape != query.shape:
+            return False
+        _import_torch_npu().npu.synchronize()
+        return bool(torch.isfinite(output).all().cpu().item())
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_mindie_fp8_attention_available() -> bool:
+    if not is_mindie_sd_available():
+        return False
+    try:
+        module = importlib.import_module("mindiesd.layers.flash_attn.quant_flash_attn")
+        entry = getattr(module, "quant_attention", None)
+        return callable(entry) and _probe_mindie_fp8_attention(entry)
+    except Exception:
+        return False
+
+
 def _probe_mindie_compile(backend_class: Any) -> bool:
     try:
 
