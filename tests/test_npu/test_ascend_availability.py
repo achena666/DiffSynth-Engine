@@ -105,15 +105,19 @@ def test_mindie_entry_availability(check, module_name, entry_name, operation_che
 
 @pytest.mark.parametrize("available", [False, True])
 def test_mindie_attention_backend_checks_entry(available):
+    """MindIE-SD 只影响快路径：缺失时不阻断后端选择，forward 会回退到融合算子。"""
     with (
         patch.object(ascend.AscendPlatform, "is_available", return_value=True),
         patch.object(ascend, "is_mindie_attention_available", return_value=available),
     ):
-        if available:
+        MindieAttentionBackend.check_availability()
+
+
+def test_mindie_attention_backend_requires_ascend_device():
+    """设备层面不可用仍然是硬错误，与 MindIE-SD 是否存在无关。"""
+    with patch.object(ascend.AscendPlatform, "is_available", return_value=False):
+        with pytest.raises(RuntimeError, match="requires an available Ascend NPU device"):
             MindieAttentionBackend.check_availability()
-        else:
-            with pytest.raises(RuntimeError, match="MindIE attention backend is not available"):
-                MindieAttentionBackend.check_availability()
 
 
 @pytest.mark.parametrize("available", [False, True])

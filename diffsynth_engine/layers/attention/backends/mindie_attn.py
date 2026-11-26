@@ -49,13 +49,12 @@ class MindieAttentionBackend(AttentionBackend):
             logger.error(error_msg)
             raise RuntimeError(error_msg)
         if not is_mindie_attention_available():
-            error_msg = (
-                "MindIE attention backend is not available. "
-                "Install MindIE-SD 3.x matching the current torch_npu and CANN versions, "
-                "and ensure mindiesd.layers.flash_attn.attention_forward works on NPU."
+            # MindIE-SD 只是快路径。缺失时 forward / forward_with_lse 会回退到
+            # torch_npu 的融合算子，所以这里只告警，不阻断后端选择。
+            logger.warning(
+                "MindIE-SD is not available; the mindie attention backend falls back to "
+                "torch_npu's fused attention (ring attention stays available)."
             )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
 
     @staticmethod
     def get_type() -> str:
@@ -109,7 +108,11 @@ class MindieAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        from mindiesd.layers.flash_attn.attention_forward import attention_forward
+        try:
+            from mindiesd.layers.flash_attn.attention_forward import attention_forward
+        except ImportError:
+            # 没有 MindIE-SD 时走 torch_npu 融合算子，与 forward_with_lse 同一条实现。
+            return self._fused_attention(query, key, value, attn_mask)[0]
 
         # MindIE attention_forward 没有 causal 参数，只接受 attn_mask（布尔张量，
         # True 表示保留/参与计算，False 表示被屏蔽）。因此当请求 causal 且调用方未显式
@@ -133,6 +136,37 @@ class MindieAttentionImpl(AttentionImpl):
             layout="BSND",
         )
 
+    def _fused_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ):
+        """torch_npu 融合注意力，返回内核原始结果（输出 + softmax 统计量）。
+
+        forward 在缺少 MindIE-SD 时也复用它，因此两个入口的数值路径完全一致。
+        """
+        import torch_npu
+
+        if self.causal and attn_mask is None:
+            q_seqlen = query.shape[1]
+            kv_seqlen = key.shape[1]
+            attn_mask = torch.tril(torch.ones(q_seqlen, kv_seqlen, dtype=torch.bool, device=query.device))
+
+        scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
+        return torch_npu.npu_fusion_attention(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            atten_mask=_prepare_attention_mask(query, key, attn_mask),
+            input_layout="BSND",
+            scale=scale,
+            pre_tockens=2147483647,
+            next_tockens=2147483647,
+            head_num=query.shape[2],
+        )
+
     def forward_with_lse(
         self,
         query: torch.Tensor,
@@ -142,26 +176,7 @@ class MindieAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        import torch_npu
-
-        if self.causal and attn_mask is None:
-            q_seqlen = query.shape[1]
-            kv_seqlen = key.shape[1]
-            attn_mask = torch.tril(torch.ones(q_seqlen, kv_seqlen, dtype=torch.bool, device=query.device))
-
-        scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1] ** -0.5
-        drop_mask = _prepare_attention_mask(query, key, attn_mask)
-        result = torch_npu.npu_fusion_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            atten_mask=drop_mask,
-            input_layout="BSND",
-            scale=scale,
-            pre_tockens=2147483647,
-            next_tockens=2147483647,
-            head_num=query.shape[2],
-        )
+        result = self._fused_attention(query, key, value, attn_mask)
         return result[0], _lse_from_softmax_stats(result)
 
 
