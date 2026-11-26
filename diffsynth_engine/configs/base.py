@@ -23,6 +23,13 @@ class SpargeAttentionParams(AttentionParams):
 
 
 @dataclass
+class MindieFp8AttentionParams(AttentionParams):
+    precision: str = "fp8"
+    fp8_fa_mode: str | None = None
+    rotation_mode: str | None = None
+
+
+@dataclass
 class PipelineConfig:
     model_path: str
     model_dtype: torch.dtype = torch.bfloat16

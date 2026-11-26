@@ -83,6 +83,31 @@ def is_mindie_attention_available() -> bool:
         return False
 
 
+def _probe_mindie_fp8_attention(quant_attention: Any) -> bool:
+    try:
+        query = torch.randn(1, 128, 8, 128, device="npu:0", dtype=torch.bfloat16)
+        with torch.no_grad():
+            output = quant_attention(query, query, query, precision="fp8", layout="BSND")
+        if output.shape != query.shape:
+            return False
+        _import_torch_npu().npu.synchronize()
+        return bool(torch.isfinite(output).all().cpu().item())
+    except Exception:
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_mindie_fp8_attention_available() -> bool:
+    if not is_mindie_sd_available():
+        return False
+    try:
+        module = importlib.import_module("mindiesd.layers.flash_attn.quant_flash_attn")
+        entry = getattr(module, "quant_attention", None)
+        return callable(entry) and _probe_mindie_fp8_attention(entry)
+    except Exception:
+        return False
+
+
 def _probe_mindie_compile(backend_class: Any) -> bool:
     try:
 
@@ -192,50 +217,6 @@ class AscendPlatform(PlatformBackend):
     # ------------------------------------------------------------------
 
     @classmethod
-    def supports_fused_attention(cls) -> bool:
-        return True
-
-    @classmethod
-    def fused_attention(
-        cls,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        num_heads: int,
-        scale: float,
-        causal: bool = False,
-        attn_mask: torch.Tensor | None = None,
-        return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        torch_npu = _import_torch_npu()
-
-        bool_mask = None
-        if attn_mask is not None:
-            # The kernel wants True = keep. Additive float masks (0 keep, -inf
-            # drop) are the common form elsewhere, so convert rather than reject.
-            bool_mask = attn_mask if attn_mask.dtype == torch.bool else attn_mask >= 0
-
-        # sparse_mode=2 is the right-down causal triangle the kernel generates
-        # internally, and it cannot be combined with an explicit mask.
-        sparse_mode = 2 if (causal and bool_mask is None) else 0
-
-        result = torch_npu.npu_fusion_attention(
-            query.contiguous(),
-            key.contiguous(),
-            value.contiguous(),
-            head_num=num_heads,
-            input_layout="BSND",
-            scale=scale,
-            keep_prob=1.0,
-            sparse_mode=sparse_mode,
-            atten_mask=bool_mask,
-        )
-        if not return_lse:
-            return result[0]
-        return result[0], _lse_from_softmax_stats(result)
-
-    @classmethod
     def dynamic_quant(cls, x: torch.Tensor, *, fp8: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         torch_npu = _import_torch_npu()
         if not fp8:
@@ -273,17 +254,3 @@ def _fp8_dst_type(platform: type[PlatformBackend]) -> int:
     if dtype is not torch.float8_e4m3fn:
         raise ValueError(f"Unexpected fp8 dtype {dtype} on {platform.name}; the fused ops only know e4m3.")
     return _ACL_FLOAT8_E4M3FN + _TORCH_NPU_DTYPE_OFFSET
-
-
-def _lse_from_softmax_stats(result: Any) -> torch.Tensor:
-    """log-sum-exp built from the softmax_max / softmax_sum the kernel returns."""
-    softmax_max, softmax_sum = result[1], result[2]
-    if not torch.is_tensor(softmax_sum) or softmax_sum.numel() == 0:
-        raise RuntimeError(
-            "npu_fusion_attention returned no softmax statistics, so ring attention cannot "
-            "merge shards. This happens on CANN builds that only fill softmax_max/softmax_sum "
-            "when gradients are required."
-        )
-    # Shape is [B, H, S, 8]: the trailing dim is alignment padding that repeats
-    # the same value, so index 0 instead of summing over it.
-    return torch.log(softmax_sum[..., 0].float().clamp(min=1e-30)) + softmax_max[..., 0].float()

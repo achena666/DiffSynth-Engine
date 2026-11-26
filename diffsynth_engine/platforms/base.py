@@ -71,40 +71,6 @@ class PlatformBackend(ABC):
     # ------------------------------------------------------------------
 
     @classmethod
-    def supports_fused_attention(cls) -> bool:
-        """Whether ``fused_attention`` is implemented for this platform."""
-        return False
-
-    @classmethod
-    def fused_attention(
-        cls,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        *,
-        num_heads: int,
-        scale: float,
-        causal: bool = False,
-        attn_mask: torch.Tensor | None = None,
-        return_lse: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Attention through the platform's fused kernel.
-
-        Args:
-            query, key, value: ``[B, S, H, D]``.
-            num_heads: number of query heads (``query.shape[2]``).
-            scale: softmax scale.
-            causal: build a causal mask inside the kernel when ``attn_mask`` is None.
-            attn_mask: boolean mask, True = keep.
-            return_lse: also return the log-sum-exp that ring attention needs in
-                order to merge per-shard partial results.
-
-        Returns:
-            ``output``, or ``(output, lse)`` with ``lse`` shaped ``[B, H, S]``.
-        """
-        raise NotImplementedError(f"{cls.name} does not provide a fused attention kernel.")
-
-    @classmethod
     def dynamic_quant(cls, x: torch.Tensor, *, fp8: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-token online quantization of activations.
 

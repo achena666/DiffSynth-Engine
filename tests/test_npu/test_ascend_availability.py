@@ -6,7 +6,10 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from diffsynth_engine.layers.attention.backends.mindie_attn import MindieAttentionBackend
+from diffsynth_engine.layers.attention.backends.mindie_attn import (
+    MindieAttentionBackend,
+    MindieAttentionFp8Backend,
+)
 from diffsynth_engine.platforms import ascend
 
 
@@ -17,6 +20,7 @@ def reset_availability_cache():
         ascend._probe_npu_runtime,
         ascend.is_mindie_sd_available,
         ascend.is_mindie_attention_available,
+        ascend.is_mindie_fp8_attention_available,
         ascend.is_mindie_compile_available,
     )
     for check in checks:
@@ -51,6 +55,12 @@ def test_mindie_dependency_availability(npu_available, import_error):
             "mindiesd.layers.flash_attn.attention_forward",
             "attention_forward",
             "_probe_mindie_attention",
+        ),
+        (
+            ascend.is_mindie_fp8_attention_available,
+            "mindiesd.layers.flash_attn.quant_flash_attn",
+            "quant_attention",
+            "_probe_mindie_fp8_attention",
         ),
         (
             ascend.is_mindie_compile_available,
@@ -106,6 +116,16 @@ def test_mindie_attention_backend_checks_entry(available):
                 MindieAttentionBackend.check_availability()
 
 
+@pytest.mark.parametrize("available", [False, True])
+def test_mindie_fp8_attention_backend_checks_entry(available):
+    with patch.object(ascend, "is_mindie_fp8_attention_available", return_value=available):
+        if available:
+            MindieAttentionFp8Backend.check_availability()
+        else:
+            with pytest.raises(RuntimeError, match="MindIE FP8 attention is not available"):
+                MindieAttentionFp8Backend.check_availability()
+
+
 def test_unavailable_mindie_compile_uses_default_backend():
     with patch.object(ascend, "is_mindie_compile_available", return_value=False):
         assert ascend.AscendPlatform.compile_kwargs() == {}
@@ -130,12 +150,12 @@ def test_available_mindie_compile_constructs_backend_without_trial_run(monkeypat
         compile_model.assert_not_called()
 
 
-@pytest.mark.parametrize("kind", ["attention", "compile"])
+@pytest.mark.parametrize("kind", ["attention", "fp8_attention", "compile"])
 @pytest.mark.parametrize("state", ["success", "shape", "nonfinite", "execution", "synchronize"])
 def test_mindie_operation_checks(kind, state):
     import torch
 
-    value = torch.ones(1, 128, 8, 128) if kind == "attention" else torch.ones(8, 32)
+    value = torch.ones(1, 128, 8, 128) if kind != "compile" else torch.ones(8, 32)
     output = value.clone()
     if state == "shape":
         output = torch.ones(1)
@@ -154,6 +174,8 @@ def test_mindie_operation_checks(kind, state):
     ):
         if kind == "attention":
             result = ascend._probe_mindie_attention(operation)
+        elif kind == "fp8_attention":
+            result = ascend._probe_mindie_fp8_attention(operation)
         else:
             result = ascend._probe_mindie_compile(Mock())
         assert result is (state == "success")

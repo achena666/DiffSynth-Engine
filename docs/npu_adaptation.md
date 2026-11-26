@@ -99,6 +99,33 @@ Qwen-Image 在构造每层 attention 时根据返回值直接创建 `AscendLongC
 `USPAttention`，各层持有独立实例。辅助函数复用已有的 MindIE 可用性检查；具体 attention
 API 的可用性仍由 attention backend 的 `check_availability()` 校验。
 
+`mindie_fp8` 使用 A5 上的 MindIE-SD `quant_attention` FP8 路径，适用于非 Ring 推理：
+
+- 输入布局为 `BSND`；`precision="fp8"` 仅支持 `B=1`，`precision="mxfp8"` 支持多 batch。
+- 支持 `precision="fp8"` 和 `precision="mxfp8"`、GQA，以及 Q/K 等长时的非 Ring causal attention。
+- 不支持非空 `attn_mask`；Qwen-Image 在单 batch 无 padding 时会将其转换为 `None`。
+- 该内核不返回 softmax statistics，因此不能用于 Ring attention；Ring 场景继续使用 `attn_type="mindie"`。
+
+Qwen-Image 可以通过 `MindieFp8AttentionParams` 配置量化精度和旋转：
+
+```python
+from diffsynth_engine.configs import MindieFp8AttentionParams, QwenImagePipelineConfig
+
+config = QwenImagePipelineConfig(
+    model_path="Qwen/Qwen-Image",
+    device="npu",
+    attn_type="mindie_fp8",
+    attn_params=MindieFp8AttentionParams(
+        precision="fp8",
+        fp8_fa_mode="HIGH_PRECISION",
+        rotation_mode="hadamard",
+    ),
+)
+```
+
+`fp8_fa_mode` 仅用于 `precision="fp8"`，可选 `HIGH_PRECISION` 或 `C8V16_TILING512`；
+`rotation_mode` 可选 `hadamard`。Wan 和 Z-Image 暂未接入该参数透传。
+
 ### 4.3 AscendLongContextAttention
 
 **文件**: `diffsynth_engine/layers/attention/ascend_long_context.py`
@@ -130,7 +157,7 @@ CPU、CUDA、ROCm、MPS 类仍放在 `platforms/__init__.py` 中默认加载，A
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `device` | `str` | `"auto"` | 设备类型: `"npu"`, `"cuda"`, `"auto"` |
-| `attn_type` | `str` | `"sdpa"` | Attention 后端: `"sdpa"`, `"flash"`, `"mindie"` |
+| `attn_type` | `str` | `"sdpa"` | Attention 后端: `"sdpa"`, `"flash"`, `"mindie"`, `"mindie_fp8"` |
 | `op_fusion` | `bool` | `True` | 是否启用算子融合 |
 | `compile_ffn` | `bool` | `False` | 是否编译 FFN (实验性，当前 NPU 无收益) |
 | `parallelism` | `int` | `1` | 并行卡数 |
