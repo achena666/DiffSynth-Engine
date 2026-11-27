@@ -37,7 +37,7 @@ def _import_mindie_sd():
 @lru_cache(maxsize=1)
 def _probe_npu_runtime(npu: Any) -> bool:
     try:
-        probe = torch.zeros(1, device="npu:0")
+        probe = torch.zeros(1, device=_probe_device(npu))
         probe.add_(1)
         npu.synchronize()
         return True
@@ -56,9 +56,27 @@ def is_mindie_sd_available() -> bool:
     return True
 
 
+def _probe_device(npu: Any | None = None) -> str:
+    """Pick the device this process actually owns.
+
+    Hard-coding ``npu:0`` makes the probe fail on every rank except the first:
+    under data/sequence parallelism each worker owns a different device and only
+    rank 0 can allocate on device 0, so ranks 1..N see the probe fail and
+    conclude the kernel is unavailable.
+
+    ``npu`` is passed in by callers that already resolved the torch_npu module
+    (the runtime probe runs before that import is guaranteed).
+    """
+    try:
+        mod = npu if npu is not None else _import_torch_npu().npu
+        return f"npu:{mod.current_device()}"
+    except Exception:
+        return "npu:0"
+
+
 def _probe_mindie_attention(attention_forward: Any) -> bool:
     try:
-        query = torch.randn(1, 128, 8, 128, device="npu:0", dtype=torch.bfloat16)
+        query = torch.randn(1, 128, 8, 128, device=_probe_device(), dtype=torch.bfloat16)
         with torch.no_grad():
             output = attention_forward(
                 query=query, key=query, value=query, attn_mask=None, scale=None, fused=True, head_first=False
@@ -85,7 +103,7 @@ def is_mindie_attention_available() -> bool:
 
 def _probe_mindie_fp8_attention(quant_attention: Any) -> bool:
     try:
-        query = torch.randn(1, 128, 8, 128, device="npu:0", dtype=torch.bfloat16)
+        query = torch.randn(1, 128, 8, 128, device=_probe_device(), dtype=torch.bfloat16)
         with torch.no_grad():
             output = quant_attention(query, query, query, precision="fp8", layout="BSND")
         if output.shape != query.shape:
@@ -115,7 +133,7 @@ def _probe_mindie_compile(backend_class: Any) -> bool:
             return torch.nn.functional.gelu(value + 1)
 
         compiled_fn = torch.compile(probe_fn, backend=backend_class(), fullgraph=False)
-        value = torch.randn(8, 32, device="npu:0", dtype=torch.bfloat16)
+        value = torch.randn(8, 32, device=_probe_device(), dtype=torch.bfloat16)
         with torch.no_grad():
             output = compiled_fn(value)
         if output.shape != value.shape:
