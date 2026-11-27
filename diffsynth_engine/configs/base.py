@@ -35,8 +35,6 @@ class PipelineConfig:
     model_dtype: torch.dtype = torch.bfloat16
     text_encoder_dtype: torch.dtype = torch.bfloat16
     vae_dtype: torch.dtype = torch.float32
-    # Ascend only: quantize the DiT linear layers to W8A8 FP8
-    fp8_linear: bool = False
     device: str | torch.device = "auto"
 
     pipeline_class_name: str | None = None

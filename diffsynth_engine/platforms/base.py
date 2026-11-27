@@ -60,33 +60,3 @@ class PlatformBackend(ABC):
     def compile_kwargs(cls) -> dict[str, Any]:
         backend = cls.compile_backend()
         return {} if backend is None else {"backend": backend}
-
-    # ------------------------------------------------------------------
-    # Compute ops.
-    #
-    # These are the kernels whose implementation differs per platform. Callers
-    # in layers/ go through them instead of importing a vendor library, so a
-    # backend never has to ask which device it is running on. Platforms that do
-    # not provide an op keep the default and the caller falls back.
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def dynamic_quant(cls, x: torch.Tensor, *, fp8: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
-        """Per-token online quantization of activations.
-
-        Returns:
-            ``(quantized, scale)`` with ``scale`` in float32, one value per row.
-        """
-        raise NotImplementedError(f"{cls.name} does not implement dynamic quantization.")
-
-    @classmethod
-    def quant_matmul(
-        cls,
-        x_q: torch.Tensor,
-        weight_q: torch.Tensor,
-        weight_scale: torch.Tensor,
-        act_scale: torch.Tensor,
-        out_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        """8-bit matmul with per-channel weight scale and per-token activation scale."""
-        raise NotImplementedError(f"{cls.name} does not implement quantized matmul.")

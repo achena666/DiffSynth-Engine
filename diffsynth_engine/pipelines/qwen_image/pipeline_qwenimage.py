@@ -181,14 +181,6 @@ class QwenImagePipeline(LoRAPipeline, Pipeline):
         # Load transformer
         transformer = cls.init_transformer(QwenImageTransformer2DModel, pipeline_config)
 
-        if getattr(pipeline_config, "fp8_linear", False):
-            from diffsynth_engine.layers.quantization.fp8_linear import enable_fp8_linear
-
-            # Quantize right after the weights are loaded: the scale has to come
-            # from the bf16 weights, and doing it once here keeps the forward path
-            # free of extra state.
-            enable_fp8_linear(transformer)
-
         # Load scheduler
         scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
             pipeline_config.model_path,
